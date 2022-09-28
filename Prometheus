@@ -1,0 +1,383 @@
+###################################################
+##  Google Cloud Managed Service for Prometheus  ##
+##  Date 28-sep-2022                             ##
+##  Somnath Ghosh somnathghosh@google.com        ##
+###################################################
+
+->#create directory and change to it
+mkdir gmp
+cd gmp
+
+->#create a main.py file and paste the below code:
+#main.py
+--------
+import random
+import time
+
+from flask import Flask
+
+from prometheus_client import (
+    Counter,
+    generate_latest,
+    Histogram,
+    REGISTRY,
+)
+
+# [END monitoring_sli_metrics_prometheus_setup]
+
+app = Flask(__name__)
+# [START monitoring_sli_metrics_prometheus_create_metrics]
+PYTHON_REQUESTS_COUNTER = Counter("python_requests", "total requests")
+PYTHON_FAILED_REQUESTS_COUNTER = Counter("python_failed_requests", "failed requests")
+PYTHON_LATENCIES_HISTOGRAM = Histogram(
+    "python_request_latency", "request latency by path"
+)
+# [END monitoring_sli_metrics_prometheus_create_metrics]
+
+
+@app.route("/")
+# [START monitoring_sli_metrics_prometheus_latency]
+@PYTHON_LATENCIES_HISTOGRAM.time()
+# [END monitoring_sli_metrics_prometheus_latency]
+def homePage():
+    # count request
+    PYTHON_REQUESTS_COUNTER.inc()
+    # fail 10% of the time
+    if random.randint(0, 100) > 90:
+        PYTHON_FAILED_REQUESTS_COUNTER.inc()
+        # [END monitoring_sli_metrics_prometheus_counts]
+        return ("error!", 500)
+    else:
+        random_delay = random.randint(0, 5000) / 1000
+        # delay for a bit to vary latency measurement
+        time.sleep(random_delay)
+        return "home page"
+
+# [START monitoring_sli_metrics_prometheus_metrics_endpoint]
+@app.route("/metrics", methods=["GET"])
+def stats():
+    return generate_latest(REGISTRY), 200
+
+# [END monitoring_sli_metrics_prometheus_metrics_endpoint]
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=8080)
+
+->#create file - requirements.txt and paste the below contents:
+#requirements.txt
+------------------
+Flask==2.1.0
+google-api-core==2.8.0
+google-auth==2.6.2
+googleapis-common-protos==1.56.1
+prometheus-client
+prometheus-flask-exporter==0.20.1
+requests==2.27.1
+
+->#create a Dockerfile and paste the below content:
+FROM python:3
+WORKDIR /usr/src/app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+ENTRYPOINT [ "python3", "./main.py" ]
+EXPOSE 8080
+
+->#build a docker image:
+docker build -t prom-example-app1 .
+
+->#tag it according to gcr naming convention:
+docker tag prom-example-app1 gcr.io/cts01-somnathghosh/prom-example-app1-image:v1
+
+->#push the image to gcr(Google Container Registry):
+docker push gcr.io/cts01-somnathghosh/prom-example-app1-image:v1
+
+->#create gke cluster:
+gcloud beta container --project "cts01-somnathghosh" clusters create "kubia-pub-gke" --zone "us-central1-c" --no-enable-basic-auth --cluster-version "1.22.12-gke.2300" --release-channel "regular" --machine-type "e2-medium" --image-type "COS_CONTAINERD" --disk-type "pd-standard" --disk-size "100" --metadata disable-legacy-endpoints=true --scopes "https://www.googleapis.com/auth/devstorage.read_only","https://www.googleapis.com/auth/logging.write","https://www.googleapis.com/auth/monitoring","https://www.googleapis.com/auth/servicecontrol","https://www.googleapis.com/auth/service.management.readonly","https://www.googleapis.com/auth/trace.append" --max-pods-per-node "110" --num-nodes "3" --logging=SYSTEM,WORKLOAD --monitoring=SYSTEM --enable-ip-alias --network "projects/cts01-somnathghosh/global/networks/kubia-vpc" --subnetwork "projects/cts01-somnathghosh/regions/us-central1/subnetworks/kubia-subnet-01" --cluster-secondary-range-name "pod-network" --services-secondary-range-name "service-network" --no-enable-intra-node-visibility --default-max-pods-per-node "110" --enable-network-policy --no-enable-master-authorized-networks --addons HorizontalPodAutoscaling,HttpLoadBalancing,GcePersistentDiskCsiDriver --enable-autoupgrade --enable-autorepair --max-surge-upgrade 1 --max-unavailable-upgrade 0 --enable-managed-prometheus --enable-vertical-pod-autoscaling --workload-pool "cts01-somnathghosh.svc.id.goog" --enable-shielded-nodes --node-locations "us-central1-c"
+
+->#connect gke cluster:
+gcloud container clusters get-credentials kubia-pub-gke --zone us-central1-c --project cts01-somnathghosh
+
+->#create the namespace - "gmp-test":
+kubectl create ns gmp-test
+
+->#create a kubernetes service account:
+kubectl create serviceaccount gmp-test-ksa \
+    --namespace gmp-test
+
+->#create a GCP service account:	 
+gcloud iam service-accounts create gmp-test-sa \
+    --project=cts01-somnathghosh
+
+->#assign roles to newly created GCP service account:
+gcloud projects add-iam-policy-binding cts01-somnathghosh \
+    --member "serviceAccount:gmp-test-sa@cts01-somnathghosh.iam.gserviceaccount.com" \
+    --role "roles/monitoring.viewer"
+    --role "roles/monitoring.writer"
+
+->#assign workload identity role to the newly created GCP service account:
+gcloud iam service-accounts add-iam-policy-binding gmp-test-sa@cts01-somnathghosh.iam.gserviceaccount.com \
+    --role roles/iam.workloadIdentityUser \
+    --member "serviceAccount:cts01-somnathghosh.svc.id.goog[gmp-test/gmp-test-ksa]"
+
+->#annotate the namespace its KSA tagged with its GSA in IAM:
+kubectl annotate serviceaccount gmp-test-ksa \
+    --namespace gmp-test \
+    iam.gke.io/gcp-service-account=gmp-test-sa@cts01-somnathghosh.iam.gserviceaccount.com        
+
+#create and download a key for the service account:
+gcloud iam service-accounts keys create gmp-test-sa-key.json \
+  --iam-account=gmp-test-sa@cts01-somnathghosh.iam.gserviceaccount.com
+
+#Add the key file as a secret to your non-GKE cluster
+ kubectl -n gmp-test create secret generic gmp-test-sa \
+  --from-file=key.json=gmp-test-sa-key.json
+
+#create the delployment file with below code:
+#Deployment.yaml
+-----------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: gmp-test
+  labels:
+    app.kubernetes.io/name: prometheus-example-app1
+  name: prometheus-example-app1
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus-example-app1
+
+  replicas: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus-example-app1
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+        iam.gke.io/gke-metadata-server-enabled: "true"
+      containers:
+      - image: gcr.io/cts01-somnathghosh/prom-example-app1-image:v1
+        name: prom-example1
+        ports:
+        - name: metrics
+          containerPort: 8080
+      serviceAccountName: gmp-test-ksa
+      
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-example-app1
+  namespace: gmp-test
+spec:
+  selector:
+    app.kubernetes.io/name: prometheus-example-app1
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: metrics
+  type: LoadBalancer
+
+->#apply the deployment file:
+kubectl apply -f Deployment.yaml
+
+-># generate load on IP address of the newly created LoadBalancer for deployment prometheus-example-app1 :
+kubectl run -i --tty load-generator --rm \
+--image=busybox:1.28 --restart=Never -- /bin/sh -c "while sleep 0.01; do wget -q -O- http://34.122.237.104/; done"
+
+->#create PodMonitoring resourceOperations:
+#Podmonitoring.yaml
+-------------------
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: prometheus-example-app1
+  namespace: gmp-test
+  labels:
+    app.kubernetes.io/name: prometheus-example-app1
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus-example-app1
+  endpoints:
+  - port: metrics
+    interval: 30s
+
+->#The simplest way to verify that your Prometheus data is being exported is to use the PromQL-based Managed Service for Prometheus page in the Google Cloud console.
+
+To view this page, do the following:
+
+1. In the Google Cloud console, go to Monitoring or use the following button:
+
+2. In the Monitoring navigation pane, click Managed Prometheus.
+
+On the Managed Service for Prometheus page, you can use PromQL queries to retrieve and chart data collected with the managed service. This page can query only data collected by Managed Service for Prometheus.
+#Link: https://cloud.google.com/stackdriver/docs/managed-prometheus/query#gmp-promql-in-monitoring
+
+->#To deploy the Prometheus UI for Managed Service for Prometheus, run the following commands:
+#create a file - frontend.yaml and paste the content below:
+#frontend.yaml
+---------------
+
+# Copyright 2021 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https:#www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: gmp-test
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      serviceAccountName: gmp-test-ksa
+      automountServiceAccountToken: true
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+        iam.gke.io/gke-metadata-server-enabled: "true"
+      containers:
+      - name: frontend
+        image: "gke.gcr.io/prometheus-engine/frontend:v0.5.0-gke.0"
+        args:
+        - "--web.listen-address=:9090"
+        - "--query.project-id=cts01-somnathghosh"
+        - "--query.credentials-file=/gmp/key.json"
+        ports:
+        - name: web
+          containerPort: 9090
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: web
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: web
+        volumeMounts:
+          - name: gmp-sa
+            mountPath: /gmp
+            readOnly: true
+      volumes:
+        - name: gmp-sa
+          secret:
+            secretName: gmp-test-sa                
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: gmp-test
+spec:
+  clusterIP: None
+  selector:
+    app: frontend
+  ports:
+  - name: web
+    port: 9090
+
+
+##Reference: https://raw.githubusercontent.com/GoogleCloudPlatform/prometheus-engine/main/examples/frontend.yaml
+
+->#apply the file with kubectl command:
+kubectl apply -f frontend.yaml
+
+->#port-forward the frontend service to your local machine. The following example forwards the service to port 9090:
+kubectl -n gmp-test port-forward svc/frontend 9090
+
+->#If you are using Cloud Shell for this step, you can get access by using the Web Preview button. In the Prometheus UI enter "up" and execute the query metric:
+#https://cloud.google.com/stackdriver/docs/managed-prometheus/query#promui-deploy
+
+->#Managed Service for Prometheus uses the built-in Prometheus data source for Grafana, meaning that you can keep using any community-created or personal Grafana dashboards without any changes.
+#create a file - grafana.yaml and paste the content below:
+#grafana.yaml
+---------------
+
+
+# Copyright 2022 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https:#www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: gmp-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      containers:
+      - name: grafana
+        image: grafana/grafana:8.3.4
+        ports:
+        - name: web
+          containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: gmp-test
+spec:
+  clusterIP: None
+  selector:
+    app: grafana
+  ports:
+  - name: web
+    port: 3000
+
+##Reference: https://raw.githubusercontent.com/GoogleCloudPlatform/prometheus-engine/main/examples/grafana.yaml
+
+->#apply the file with kubectl command:
+kubectl apply -f grafana.yaml
+
+
+->#Port-forward the frontend service to your local machine.
+kubectl -n gmp-test port-forward svc/grafana 3000
+
+->#to configure a data source in grafana please follow the below link
+#Link: https://cloud.google.com/stackdriver/docs/managed-prometheus/query#grafana-datasource
+
+  
+
